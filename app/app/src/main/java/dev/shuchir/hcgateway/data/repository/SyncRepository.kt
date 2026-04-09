@@ -1,6 +1,8 @@
 package dev.shuchir.hcgateway.data.repository
 
 import com.google.gson.Gson
+import com.google.gson.JsonArray
+import com.google.gson.JsonElement
 import dev.shuchir.hcgateway.data.local.PreferencesRepository
 import dev.shuchir.hcgateway.data.remote.ApiService
 import dev.shuchir.hcgateway.data.remote.DeleteRequest
@@ -37,6 +39,7 @@ class SyncRepository @Inject constructor(
         private const val TAG = "Sync"
         const val MIN_SYNC_DISPLAY_MS = 1000L
         private const val DEFAULT_LOOKBACK_DAYS = 29L
+        private const val BATCH_PAGES = 4
     }
 
     private val _syncState = MutableStateFlow<SyncState>(SyncState.Idle)
@@ -144,7 +147,7 @@ class SyncRepository @Inject constructor(
             RECORD_TYPES.map { type ->
                 async(kotlinx.coroutines.Dispatchers.IO) {
                     try {
-                        val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(1)
+                        val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(4)
                         var typeTotal = 0
 
                         var readerError: Exception? = null
@@ -169,11 +172,32 @@ class SyncRepository @Inject constructor(
                             }
                         }
 
-                        // Consumer: upload pages to API server
+                        // Consumer: batch pages and upload to API server
+                        val batch = mutableListOf<Pair<JsonElement, Int>>()
+                        var batchRecords = 0
+
                         for ((json, pageSize) in channel) {
                             coroutineContext.ensureActive()
-                            apiService.syncRecords(type.name, SyncRequest(json))
-                            val synced = totalRecordsAtomic.addAndGet(pageSize)
+                            batch.add(json to pageSize)
+                            batchRecords += pageSize
+
+                            if (batch.size >= BATCH_PAGES) {
+                                val merged = mergeJsonArrays(batch.map { it.first })
+                                apiService.syncRecords(type.name, SyncRequest(merged))
+                                val synced = totalRecordsAtomic.addAndGet(batchRecords)
+                                currentRecordCount = synced
+                                updateSyncState(SyncState.Syncing(
+                                    type.name, completed.get(), RECORD_TYPES.size, synced,
+                                ))
+                                batch.clear()
+                                batchRecords = 0
+                            }
+                        }
+                        // Flush remaining
+                        if (batch.isNotEmpty()) {
+                            val merged = mergeJsonArrays(batch.map { it.first })
+                            apiService.syncRecords(type.name, SyncRequest(merged))
+                            val synced = totalRecordsAtomic.addAndGet(batchRecords)
                             currentRecordCount = synced
                             updateSyncState(SyncState.Syncing(
                                 type.name, completed.get(), RECORD_TYPES.size, synced,
@@ -287,5 +311,18 @@ class SyncRepository @Inject constructor(
 
     fun resetState() {
         _syncState.value = SyncState.Idle
+    }
+
+    private fun mergeJsonArrays(arrays: List<JsonElement>): JsonElement {
+        if (arrays.size == 1) return arrays[0]
+        val merged = JsonArray()
+        for (element in arrays) {
+            if (element.isJsonArray) {
+                element.asJsonArray.forEach { merged.add(it) }
+            } else {
+                merged.add(element)
+            }
+        }
+        return merged
     }
 }

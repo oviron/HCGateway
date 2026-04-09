@@ -1,5 +1,5 @@
 from flask import Blueprint, request, jsonify, g
-import os, json
+import os, json, gzip, io
 from dotenv import load_dotenv
 load_dotenv()
 from pyfcm import FCMNotification
@@ -14,11 +14,27 @@ ph = PasswordHasher()
 
 from cryptography.fernet import Fernet
 import base64, secrets, datetime
+from functools import lru_cache
+
+@lru_cache(maxsize=64)
+def _get_fernet(hashed_password):
+    key = base64.urlsafe_b64encode(hashed_password.encode("utf-8").ljust(32)[:32])
+    return Fernet(key)
 
 v2 = Blueprint('v2', __name__, url_prefix='/api/v2/')
 
+def get_json():
+    """Get parsed JSON, supporting gzip-compressed request bodies."""
+    return getattr(request, '_parsed_json', None) or request.json
+
 @v2.before_request
 def before_request():
+    # Decompress gzip request bodies
+    if request.content_encoding == 'gzip':
+        raw = gzip.decompress(request.get_data())
+        request._cached_data = raw
+        request._parsed_json = json.loads(raw)
+
     if request.endpoint == 'v2.login' or request.endpoint == 'v2.refresh':
         return
     
@@ -43,11 +59,12 @@ def before_request():
 
 @v2.route("/login", methods=['POST'])
 def login(): 
-    if not request.json or not 'username' in request.json or not 'password' in request.json:
+    body = get_json()
+    if not body or not 'username' in body or not 'password' in body:
         return jsonify({'error': 'invalid request'}), 400
-    username = request.json['username']
-    password = request.json['password']
-    fcmToken = request.json['fcmToken'] if 'fcmToken' in request.json else None
+    username = body['username']
+    password = body['password']
+    fcmToken = body.get('fcmToken')
 
     db = mongo['hcgateway']
     usrStore = db['users']
@@ -102,10 +119,11 @@ def login():
 
 @v2.route("/refresh", methods=['POST'])
 def refresh():
-    if not request.json or not 'refresh' in request.json:
+    body = get_json()
+    if not body or not 'refresh' in body:
         return jsonify({'error': 'invalid request'}), 400
 
-    refresh = request.json['refresh']
+    refresh = body['refresh']
 
     db = mongo['hcgateway']
     usrStore = db['users']
@@ -159,7 +177,8 @@ def sync(method):
     method = method[0].lower() + method[1:]
     if not method:
         return jsonify({'error': 'no method provided'}), 400
-    if not "data" in request.json:
+    body = get_json()
+    if not "data" in body:
         return jsonify({'error': 'no data provided'}), 400
 
     userid = g.user
@@ -170,11 +189,9 @@ def sync(method):
     try: user = usrStore.find_one({'_id': userid})
     except InvalidId: return jsonify({'error': 'invalid user id'}), 400
 
-    hashed_password = user['password']
-    key = base64.urlsafe_b64encode(hashed_password.encode("utf-8").ljust(32)[:32])
-    fernet = Fernet(key)
+    fernet = _get_fernet(user['password'])
 
-    data = request.json['data']
+    data = body['data']
     if type(data) != list:
         data = [data]
     print(f"{method}: {len(data)} records")
@@ -224,14 +241,13 @@ def fetch(method):
     try: user = usrStore.find_one({'_id': userid})
     except InvalidId: return jsonify({'error': 'invalid user id'}), 400
 
-    hashed_password = user['password']
-    key = base64.urlsafe_b64encode(hashed_password.encode("utf-8").ljust(32)[:32])
-    fernet = Fernet(key)
+    fernet = _get_fernet(user['password'])
 
-    if not "queries" in request.json:
+    body = get_json()
+    if not "queries" in body:
         queries = []
     else:
-        queries = request.json['queries']
+        queries = body['queries']
     
     db = mongo['hcgateway_'+userid]
     collection = db[method]
@@ -247,11 +263,12 @@ def fetch(method):
 def pushData(method):
     if not method:
         return jsonify({'error': 'no method provided'}), 400
-    if not "data" in request.json:
+    body = get_json()
+    if not "data" in body:
         return jsonify({'error': 'no data provided'}), 400
 
     userid = g.user
-    data = request.json['data']
+    data = body['data']
     if type(data) != list:
         data = [data]
 
@@ -289,11 +306,12 @@ def pushData(method):
 def delData(method):
     if not method:
         return jsonify({'error': 'no method provided'}), 400
-    if not "uuid" in request.json:
+    body = get_json()
+    if not "uuid" in body:
         return jsonify({'error': 'no uuid provided'}), 400
 
     userid = g.user
-    uuids = request.json['uuid']
+    uuids = body['uuid']
     if type(uuids) != list:
         uuids = [uuids]
 
@@ -331,11 +349,12 @@ def delFromDb(method):
     method = method[0].lower() + method[1:]
     if not method:
         return jsonify({'error': 'no method provided'}), 400
-    if not "uuid" in request.json:
+    body = get_json()
+    if not "uuid" in body:
         return jsonify({'error': 'no uuid provided'}), 400
 
     userid = g.user
-    uuids = request.json['uuid']
+    uuids = body['uuid']
 
     if type(uuids) != list:
         uuids = [uuids]
