@@ -7,6 +7,7 @@ sealed class SyncState {
         val typesCompleted: Int,
         val totalTypes: Int,
         val recordsSynced: Int = 0,
+        val completedTypes: List<TypeSyncResult> = emptyList(),
     ) : SyncState()
     data class Error(val message: String) : SyncState()
     data class Done(

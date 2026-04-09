@@ -193,6 +193,7 @@ class SyncRepository @Inject constructor(
                             currentRecordCount = totalRecords
                             updateSyncState(SyncState.Syncing(
                                 type.name, completedCount, RECORD_TYPES.size, totalRecords,
+                                completedTypes = typeResults.toList(),
                             ))
                             batch.clear()
                             batchRecords = 0

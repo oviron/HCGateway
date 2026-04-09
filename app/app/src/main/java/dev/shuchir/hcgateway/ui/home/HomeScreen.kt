@@ -257,8 +257,8 @@ fun HomeScreen(
                         val records = syncingState.recordsSynced
                         val currentType = syncingState.currentType
                         lastStatusText = when {
-                            records > 0 -> "$types · $records records"
-                            currentType.isNotBlank() -> "$types · $currentType…"
+                            currentType.isNotBlank() && records > 0 -> "Reading $currentType… · $types · $records records"
+                            currentType.isNotBlank() -> "Reading $currentType… · $types"
                             else -> types
                         }
                     }
@@ -274,6 +274,32 @@ fun HomeScreen(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             modifier = Modifier.padding(top = 8.dp).height(statusTextHeight),
                         )
+                    }
+
+                    // Show completed types with record counts
+                    if (syncingState != null && syncingState.completedTypes.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Column(
+                            verticalArrangement = Arrangement.spacedBy(2.dp),
+                        ) {
+                            syncingState.completedTypes.forEach { result ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                ) {
+                                    Text(
+                                        "✓ ${result.typeName}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = ExtendedTheme.colors.onSuccessContainer,
+                                    )
+                                    Text(
+                                        "${result.recordCount}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                        }
                     }
                     Spacer(Modifier.height(if (progressHeight > 8.dp) 4.dp else 0.dp))
                 }
