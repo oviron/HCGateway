@@ -1,24 +1,26 @@
-
 services:
   api:
-    image: ghcr.io/shuchirj/hcgateway:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     ports:
-      - "6644:6644"
+      - "127.0.0.1:6644:6644"
     env_file:
       - ./api/.env
     container_name: hcgateway_api
     restart: always
-    volumes:
-      - ./api/service-account.json:/app/service-account.json
+    depends_on:
+      - db
 
   db:
-    image: mongo
+    image: mongo:8
     restart: always
-    ports:
-      - "27017:27017"
     volumes:
-      - ./db:/data/db
+      - mongo_data:/data/db
     container_name: hcgateway_db
     environment:
-      MONGO_INITDB_ROOT_USERNAME: root
-      MONGO_INITDB_ROOT_PASSWORD: example
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hcgateway}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:-changeme}
+
+volumes:
+  mongo_data:
