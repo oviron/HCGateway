@@ -45,7 +45,7 @@ def before_request():
     db = mongo['hcgateway']
     usrStore = db['users']
 
-    user = usrStore.find_one({'token': token})
+    user = usrStore.find_one({'$or': [{'token': token}, {'prev_token': token}]})
 
     if not user:
         return jsonify({'error': 'invalid token'}), 403
@@ -133,10 +133,11 @@ def refresh():
     if not user:
         return jsonify({'error': 'invalid refresh token'}), 403
     
+    old_token = user.get('token', '')
     token = secrets.token_urlsafe(32)
     # refresh = secrets.token_urlsafe(32) # disable refresh token rotation- design flaw, see #35
     expiryDate = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=12)
-    usrStore.update_one({'_id': user['_id']}, {"$set": {'token': token, 'refresh': refresh, 'expiry': expiryDate}})
+    usrStore.update_one({'_id': user['_id']}, {"$set": {'token': token, 'prev_token': old_token, 'refresh': refresh, 'expiry': expiryDate}})
 
     return jsonify({
             "token": token,
