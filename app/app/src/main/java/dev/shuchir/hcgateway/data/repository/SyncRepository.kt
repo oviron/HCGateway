@@ -230,7 +230,7 @@ class SyncRepository @Inject constructor(
                         e.cause is SecurityException ||
                         e.message?.contains("SecurityException") == true
                     if (!isUnsupported) {
-                        log.e(TAG, "${type.name} failed: ${e.message}", e)
+                        log.e(TAG, "${type.name} failed: ${e.javaClass.simpleName}: ${e.message}")
                         failedTypes.add(type.name)
                     } else {
                         log.i(TAG, "${type.name}: skipped (unsupported)")
