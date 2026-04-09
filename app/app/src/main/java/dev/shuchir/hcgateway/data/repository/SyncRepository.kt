@@ -17,7 +17,6 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
-import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
@@ -136,119 +135,104 @@ class SyncRepository @Inject constructor(
         typeResults: MutableList<TypeSyncResult>,
         failedTypes: MutableList<String> = mutableListOf(),
     ): Int {
-        val completed = AtomicInteger(0)
-        val totalRecordsAtomic = AtomicInteger(0)
+        var completedCount = 0
+        var totalRecords = 0
 
-        // Health Connect serializes reads internally (single IPC channel), so launching
-        // all types concurrently just queues them. Instead, sync in two phases:
-        // Phase 1: lightweight types (no per-second samples) — finish fast
-        // Phase 2: heavy types with samples — these take minutes
+        // Health Connect IPC is single-threaded (one Binder channel). Parallel reads
+        // just queue up and burn rate-limit quota. Read types sequentially, but
+        // overlap HC reads with server uploads via a producer-consumer channel.
+        // Lightweight types first so useful data reaches the server ASAP;
+        // heavy sample-based types (HeartRate, StepsCadence, etc.) last.
         val heavyTypes = setOf(
             "StepsCadence", "HeartRate", "Speed", "Power",
             "CyclingPedalingCadence", "SkinTemperature",
         )
-        val lightTypes = RECORD_TYPES.filter { it.name !in heavyTypes }
-        val heavyTypesList = RECORD_TYPES.filter { it.name in heavyTypes }
+        val sortedTypes = RECORD_TYPES.sortedBy { if (it.name in heavyTypes) 1 else 0 }
 
-        suspend fun syncTypes(types: List<dev.shuchir.hcgateway.domain.model.RecordTypeInfo>) {
+        for (type in sortedTypes) {
             coroutineScope {
-                types.map { type ->
-                    async(kotlinx.coroutines.Dispatchers.IO) {
-                    try {
-                        val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(4)
-                        var typeTotal = 0
+                ensureActive()
+                try {
+                    val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(4)
+                    var typeTotal = 0
+                    var readerError: Exception? = null
 
-                        var readerError: Exception? = null
-
-                        // Producer: read pages from Health Connect
-                        val reader = launch {
-                            try {
-                                healthConnectRepository.readRecordsPaged(
-                                    type.recordClass, startTime, endTime,
-                                ) { page ->
-                                    coroutineContext.ensureActive()
-                                    val json = healthConnectRepository.recordsToJson(page)
-                                    typeTotal += page.size
-                                    channel.send(json to page.size)
-                                }
-                            } catch (e: CancellationException) {
-                                throw e
-                            } catch (e: Exception) {
-                                readerError = e
-                            } finally {
-                                channel.close()
+                    // Producer: read pages from Health Connect (sequential IPC)
+                    val reader = launch(kotlinx.coroutines.Dispatchers.IO) {
+                        try {
+                            healthConnectRepository.readRecordsPaged(
+                                type.recordClass, startTime, endTime,
+                            ) { page ->
+                                coroutineContext.ensureActive()
+                                val json = healthConnectRepository.recordsToJson(page)
+                                typeTotal += page.size
+                                channel.send(json to page.size)
                             }
-                        }
-
-                        // Consumer: batch pages and upload to API server
-                        val batch = mutableListOf<Pair<JsonElement, Int>>()
-                        var batchRecords = 0
-
-                        for ((json, pageSize) in channel) {
-                            coroutineContext.ensureActive()
-                            batch.add(json to pageSize)
-                            batchRecords += pageSize
-
-                            if (batch.size >= BATCH_PAGES) {
-                                val merged = mergeJsonArrays(batch.map { it.first })
-                                apiService.syncRecords(type.name, SyncRequest(merged))
-                                val synced = totalRecordsAtomic.addAndGet(batchRecords)
-                                currentRecordCount = synced
-                                updateSyncState(SyncState.Syncing(
-                                    type.name, completed.get(), RECORD_TYPES.size, synced,
-                                ))
-                                batch.clear()
-                                batchRecords = 0
-                            }
-                        }
-                        // Flush remaining
-                        if (batch.isNotEmpty()) {
-                            val merged = mergeJsonArrays(batch.map { it.first })
-                            apiService.syncRecords(type.name, SyncRequest(merged))
-                            val synced = totalRecordsAtomic.addAndGet(batchRecords)
-                            currentRecordCount = synced
-                            updateSyncState(SyncState.Syncing(
-                                type.name, completed.get(), RECORD_TYPES.size, synced,
-                            ))
-                        }
-
-                        reader.join()
-                        readerError?.let { throw it }
-
-                        if (typeTotal > 0) {
-                            android.util.Log.d(TAG, "${type.name}: $typeTotal records")
-                            synchronized(typeResults) {
-                                typeResults.add(TypeSyncResult(type.name, typeTotal))
-                            }
-                        }
-                    } catch (e: Exception) {
-                        // Skip unsupported types (SecurityException = no permission granted by HC)
-                        val isUnsupported = e is SecurityException ||
-                            e.cause is SecurityException ||
-                            e.message?.contains("SecurityException") == true
-                        if (!isUnsupported) {
-                            android.util.Log.e(TAG, "${type.name} failed: ${e.message}", e)
-                            synchronized(failedTypes) { failedTypes.add(type.name) }
-                        } else {
-                            android.util.Log.d(TAG, "${type.name}: skipped (unsupported)")
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            readerError = e
+                        } finally {
+                            channel.close()
                         }
                     }
-                    val done = completed.incrementAndGet()
-                    updateSyncState(SyncState.Syncing(
-                        type.name, done, RECORD_TYPES.size, totalRecordsAtomic.get(),
-                    ))
+
+                    // Consumer: batch pages and upload to server (overlaps with HC reads)
+                    val batch = mutableListOf<Pair<JsonElement, Int>>()
+                    var batchRecords = 0
+
+                    for ((json, pageSize) in channel) {
+                        ensureActive()
+                        batch.add(json to pageSize)
+                        batchRecords += pageSize
+
+                        if (batch.size >= BATCH_PAGES) {
+                            val merged = mergeJsonArrays(batch.map { it.first })
+                            apiService.syncRecords(type.name, SyncRequest(merged))
+                            totalRecords += batchRecords
+                            currentRecordCount = totalRecords
+                            updateSyncState(SyncState.Syncing(
+                                type.name, completedCount, RECORD_TYPES.size, totalRecords,
+                            ))
+                            batch.clear()
+                            batchRecords = 0
+                        }
+                    }
+                    // Flush remaining
+                    if (batch.isNotEmpty()) {
+                        val merged = mergeJsonArrays(batch.map { it.first })
+                        apiService.syncRecords(type.name, SyncRequest(merged))
+                        totalRecords += batchRecords
+                        currentRecordCount = totalRecords
+                        updateSyncState(SyncState.Syncing(
+                            type.name, completedCount, RECORD_TYPES.size, totalRecords,
+                        ))
+                    }
+
+                    reader.join()
+                    readerError?.let { throw it }
+
+                    if (typeTotal > 0) {
+                        android.util.Log.d(TAG, "${type.name}: $typeTotal records")
+                        typeResults.add(TypeSyncResult(type.name, typeTotal))
+                    }
+                } catch (e: Exception) {
+                    val isUnsupported = e is SecurityException ||
+                        e.cause is SecurityException ||
+                        e.message?.contains("SecurityException") == true
+                    if (!isUnsupported) {
+                        android.util.Log.e(TAG, "${type.name} failed: ${e.message}", e)
+                        failedTypes.add(type.name)
+                    } else {
+                        android.util.Log.d(TAG, "${type.name}: skipped (unsupported)")
+                    }
                 }
-            }.awaitAll()
+                completedCount++
+                updateSyncState(SyncState.Syncing(
+                    type.name, completedCount, RECORD_TYPES.size, totalRecords,
+                ))
             }
         }
-
-        // Phase 1: sync lightweight types first — they finish in seconds
-        android.util.Log.d(TAG, "Phase 1: syncing ${lightTypes.size} lightweight types")
-        syncTypes(lightTypes)
-
-        // Phase 2: sync heavy types with per-second samples
-        android.util.Log.d(TAG, "Phase 2: syncing ${heavyTypesList.size} heavy types (samples)")
-        syncTypes(heavyTypesList)
 
         try {
             val token = healthConnectRepository.getChangesToken()
