@@ -3,8 +3,8 @@ services:
     build:
       context: ./api
       dockerfile: Dockerfile
-    ports:
-      - "127.0.0.1:6644:6644"
+    expose:
+      - "6644"
     env_file:
       - ./api/.env
     container_name: hcgateway_api
@@ -22,5 +22,21 @@ services:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER:-hcgateway}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS:-changeme}
 
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    container_name: hcgateway_caddy
+    restart: always
+    depends_on:
+      - api
+
 volumes:
   mongo_data:
+  caddy_data:
+  caddy_config:
