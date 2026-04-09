@@ -32,6 +32,7 @@ class SyncRepository @Inject constructor(
     private val apiService: ApiService,
     private val preferencesRepository: PreferencesRepository,
     private val gson: Gson,
+    private val log: RemoteLogger,
 ) {
     companion object {
         private const val TAG = "Sync"
@@ -86,20 +87,20 @@ class SyncRepository @Inject constructor(
             val settings = preferencesRepository.settings.first()
 
             if (customStartDate != null) {
-                android.util.Log.d(TAG, "Force sync: $customStartDate → ${customEndDate ?: LocalDate.now()}")
+                log.i(TAG, "Force sync: $customStartDate → ${customEndDate ?: LocalDate.now()}")
                 val startTime = customStartDate.atStartOfDay(ZoneId.of("UTC")).toInstant()
                 val endTime = (customEndDate ?: LocalDate.now()).plusDays(1)
                     .atStartOfDay(ZoneId.of("UTC")).toInstant()
                 totalRecords = fullSync(startTime, endTime, typeResults, failedTypes)
             } else if (settings.fullSyncMode) {
-                android.util.Log.d(TAG, "Full sync (${DEFAULT_LOOKBACK_DAYS}d lookback)")
+                log.i(TAG, "Full sync (${DEFAULT_LOOKBACK_DAYS}d lookback)")
                 val startTime = Instant.now().minus(java.time.Duration.ofDays(DEFAULT_LOOKBACK_DAYS))
                 totalRecords = fullSync(startTime, Instant.now(), typeResults, failedTypes)
             } else if (settings.changesToken.isNotBlank()) {
-                android.util.Log.d(TAG, "Delta sync")
+                log.i(TAG, "Delta sync")
                 totalRecords = deltaSync(settings.changesToken, typeResults, failedTypes)
             } else {
-                android.util.Log.d(TAG, "Initial full sync (no changes token)")
+                log.i(TAG, "Initial full sync (no changes token)")
                 val startTime = Instant.now().minus(java.time.Duration.ofDays(DEFAULT_LOOKBACK_DAYS))
                 totalRecords = fullSync(startTime, Instant.now(), typeResults, failedTypes)
             }
@@ -115,16 +116,18 @@ class SyncRepository @Inject constructor(
                 preferencesRepository.updateLastSyncResults(gson.toJson(typeResults))
             }
             val totalElapsed = System.currentTimeMillis() - syncStartTime
-            android.util.Log.d(TAG, "Sync done: $totalRecords records in ${totalElapsed}ms, ${failedTypes.size} failed")
+            log.i(TAG, "Sync done: $totalRecords records in ${totalElapsed}ms, ${failedTypes.size} failed")
+            log.flush()
             _syncState.value = SyncState.Done(totalRecords, typeResults, failedTypes)
         } catch (e: CancellationException) {
-            android.util.Log.d(TAG, "Sync cancelled")
+            log.i(TAG, "Sync cancelled")
+            log.flush()
             if (typeResults.isNotEmpty()) {
                 preferencesRepository.updateLastSyncResults(gson.toJson(typeResults))
             }
             throw e
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "Sync error: ${e.message}")
+            log.e(TAG, "Sync error: ${e.message}")
             _syncState.value = SyncState.Error(e.message ?: "Sync failed")
         }
     }
@@ -152,6 +155,8 @@ class SyncRepository @Inject constructor(
         for (type in sortedTypes) {
             coroutineScope {
                 ensureActive()
+                log.i(TAG, "Reading ${type.name}...")
+                val typeStartMs = System.currentTimeMillis()
                 try {
                     val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(4)
                     var typeTotal = 0
@@ -213,19 +218,22 @@ class SyncRepository @Inject constructor(
                     reader.join()
                     readerError?.let { throw it }
 
+                    val typeElapsed = System.currentTimeMillis() - typeStartMs
                     if (typeTotal > 0) {
-                        android.util.Log.d(TAG, "${type.name}: $typeTotal records")
+                        log.i(TAG, "${type.name}: $typeTotal records in ${typeElapsed}ms")
                         typeResults.add(TypeSyncResult(type.name, typeTotal))
+                    } else {
+                        log.d(TAG, "${type.name}: empty (${typeElapsed}ms)")
                     }
                 } catch (e: Exception) {
                     val isUnsupported = e is SecurityException ||
                         e.cause is SecurityException ||
                         e.message?.contains("SecurityException") == true
                     if (!isUnsupported) {
-                        android.util.Log.e(TAG, "${type.name} failed: ${e.message}", e)
+                        log.e(TAG, "${type.name} failed: ${e.message}", e)
                         failedTypes.add(type.name)
                     } else {
-                        android.util.Log.d(TAG, "${type.name}: skipped (unsupported)")
+                        log.i(TAG, "${type.name}: skipped (unsupported)")
                     }
                 }
                 completedCount++
@@ -238,12 +246,12 @@ class SyncRepository @Inject constructor(
         try {
             val token = healthConnectRepository.getChangesToken()
             preferencesRepository.updateChangesToken(token)
-            android.util.Log.d(TAG, "Changes token saved")
+            log.i(TAG, "Changes token saved")
         } catch (e: Exception) {
-            android.util.Log.e(TAG, "Failed to save changes token: ${e.message}")
+            log.e(TAG, "Failed to save changes token: ${e.message}")
         }
 
-        return totalRecordsAtomic.get()
+        return totalRecords
     }
 
     private suspend fun deltaSync(
@@ -261,37 +269,30 @@ class SyncRepository @Inject constructor(
             return fullSync(startTime, Instant.now(), typeResults, failedTypes)
         }
 
-        val completed = AtomicInteger(0)
-        val totalRecordsAtomic = AtomicInteger(0)
         val totalTypes = result.upsertedRecords.size
+        var completedCount = 0
 
         updateSyncState(SyncState.Syncing("", 0, totalTypes))
 
-        coroutineScope {
-            result.upsertedRecords.map { (typeName, records) ->
-                async {
-                    if (records.isNotEmpty()) {
-                        try {
-                            val json = healthConnectRepository.recordsToJson(records)
-                            apiService.syncRecords(typeName, SyncRequest(json))
-                            totalRecordsAtomic.addAndGet(records.size)
-                            currentRecordCount = totalRecordsAtomic.get()
-                            synchronized(typeResults) {
-                                typeResults.add(TypeSyncResult(typeName, records.size))
-                            }
-                        } catch (_: Exception) {
-                            synchronized(failedTypes) { failedTypes.add(typeName) }
-                        }
-                    }
-                    val done = completed.incrementAndGet()
-                    updateSyncState(SyncState.Syncing(
-                        typeName, done, totalTypes, totalRecordsAtomic.get(),
-                    ))
+        for ((typeName, records) in result.upsertedRecords) {
+            if (records.isNotEmpty()) {
+                try {
+                    log.i(TAG, "Delta: $typeName (${records.size} records)")
+                    val json = healthConnectRepository.recordsToJson(records)
+                    apiService.syncRecords(typeName, SyncRequest(json))
+                    totalRecords += records.size
+                    currentRecordCount = totalRecords
+                    typeResults.add(TypeSyncResult(typeName, records.size))
+                } catch (_: Exception) {
+                    failedTypes.add(typeName)
                 }
-            }.awaitAll()
+            }
+            completedCount++
+            updateSyncState(SyncState.Syncing(
+                typeName, completedCount, totalTypes, totalRecords,
+                completedTypes = typeResults.toList(),
+            ))
         }
-
-        totalRecords = totalRecordsAtomic.get()
 
         if (result.nextToken.isNotBlank()) {
             preferencesRepository.updateChangesToken(result.nextToken)

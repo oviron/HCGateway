@@ -12,6 +12,7 @@ import dev.shuchir.hcgateway.data.remote.ApiService
 import dev.shuchir.hcgateway.data.remote.RefreshRequest
 import dev.shuchir.hcgateway.data.repository.HealthConnectRepository
 import dev.shuchir.hcgateway.data.repository.NetworkMonitor
+import dev.shuchir.hcgateway.data.repository.RemoteLogger
 import dev.shuchir.hcgateway.data.repository.SyncRepository
 import dev.shuchir.hcgateway.domain.model.RECORD_TYPES
 import dev.shuchir.hcgateway.domain.model.SyncState
@@ -35,7 +36,12 @@ class HomeViewModel @Inject constructor(
     private val healthConnectRepository: HealthConnectRepository,
     private val apiService: ApiService,
     private val networkMonitor: NetworkMonitor,
+    private val log: RemoteLogger,
 ) : ViewModel() {
+
+    companion object {
+        private const val TAG = "Connection"
+    }
 
     val settings: StateFlow<UserSettings> = preferencesRepository.settings
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserSettings())
@@ -84,6 +90,7 @@ class HomeViewModel @Inject constructor(
         // Re-check when network state changes
         viewModelScope.launch {
             networkMonitor.isConnected.collect { connected ->
+                log.i(TAG, "Network: ${if (connected) "connected" else "disconnected"}")
                 if (connected) {
                     checkServerConnection()
                 } else {
@@ -107,12 +114,18 @@ class HomeViewModel @Inject constructor(
                     if (response.isSuccessful && response.body() != null) {
                         val body = response.body()!!
                         preferencesRepository.saveTokens(body.token, body.refresh)
+                        log.d(TAG, "Server reachable (refresh OK)")
                         true
                     } else {
+                        log.w(TAG, "Server returned ${response.code()}: ${response.errorBody()?.string()?.take(200)}")
                         false
                     }
                 }
-            } catch (_: Exception) {
+            } catch (e: TimeoutCancellationException) {
+                log.w(TAG, "Server check timeout (5s)")
+                false
+            } catch (e: Exception) {
+                log.w(TAG, "Server check failed: ${e.javaClass.simpleName}: ${e.message}")
                 false
             }
             _serverReachable.value = reachable

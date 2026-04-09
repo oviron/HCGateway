@@ -173,6 +173,37 @@ def counts():
         result[display_name] = db[col_name].count_documents({})
     return jsonify(result), 200
 
+@v2.post("/logs")
+def logs():
+    body = get_json()
+    entries = body.get('entries', [])
+    userid = g.user
+    db = mongo['hcgateway_' + userid]
+    if entries:
+        docs = []
+        for entry in entries:
+            docs.append({
+                'ts': entry.get('ts', datetime.datetime.now(datetime.timezone.utc).isoformat()),
+                'level': entry.get('level', 'INFO'),
+                'tag': entry.get('tag', ''),
+                'msg': entry.get('msg', ''),
+            })
+        db['_logs'].insert_many(docs)
+    return jsonify({'success': True, 'count': len(entries)}), 200
+
+@v2.get("/logs")
+def get_logs():
+    userid = g.user
+    db = mongo['hcgateway_' + userid]
+    limit = int(request.args.get('limit', 100))
+    tag = request.args.get('tag')
+    query = {'tag': tag} if tag else {}
+    docs = list(db['_logs'].find(query).sort('_id', -1).limit(limit))
+    for doc in docs:
+        doc['_id'] = str(doc['_id'])
+    docs.reverse()
+    return jsonify(docs), 200
+
 @v2.post("/sync/<method>")
 def sync(method):
     method = method[0].lower() + method[1:]

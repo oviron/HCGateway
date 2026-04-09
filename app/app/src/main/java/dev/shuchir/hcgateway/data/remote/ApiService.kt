@@ -1,5 +1,6 @@
 package dev.shuchir.hcgateway.data.remote
 
+import dev.shuchir.hcgateway.data.repository.LogRequest
 import retrofit2.Response
 import retrofit2.http.Body
 import retrofit2.http.GET
@@ -29,4 +30,7 @@ interface ApiService {
 
     @GET("api/v2/counts")
     suspend fun getCounts(): Response<Map<String, Int>>
+
+    @POST("api/v2/logs")
+    suspend fun sendLogs(@Body request: LogRequest): Response<Unit>
 }
