@@ -5,7 +5,6 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonElement
 import dev.shuchir.hcgateway.data.local.PreferencesRepository
 import dev.shuchir.hcgateway.data.remote.ApiService
-import dev.shuchir.hcgateway.data.remote.DeleteRequest
 import dev.shuchir.hcgateway.data.remote.SyncRequest
 import dev.shuchir.hcgateway.domain.model.RECORD_TYPES
 import dev.shuchir.hcgateway.domain.model.SyncState
@@ -140,12 +139,21 @@ class SyncRepository @Inject constructor(
         val completed = AtomicInteger(0)
         val totalRecordsAtomic = AtomicInteger(0)
 
-        // Pipeline: for each type, read pages into a channel while a sender coroutine
-        // uploads them in parallel. This overlaps HC API reads with API server uploads.
-        // All types run concurrently — empty types complete instantly.
-        coroutineScope {
-            RECORD_TYPES.map { type ->
-                async(kotlinx.coroutines.Dispatchers.IO) {
+        // Health Connect serializes reads internally (single IPC channel), so launching
+        // all types concurrently just queues them. Instead, sync in two phases:
+        // Phase 1: lightweight types (no per-second samples) — finish fast
+        // Phase 2: heavy types with samples — these take minutes
+        val heavyTypes = setOf(
+            "StepsCadence", "HeartRate", "Speed", "Power",
+            "CyclingPedalingCadence", "SkinTemperature",
+        )
+        val lightTypes = RECORD_TYPES.filter { it.name !in heavyTypes }
+        val heavyTypesList = RECORD_TYPES.filter { it.name in heavyTypes }
+
+        suspend fun syncTypes(types: List<dev.shuchir.hcgateway.domain.model.RecordTypeInfo>) {
+            coroutineScope {
+                types.map { type ->
+                    async(kotlinx.coroutines.Dispatchers.IO) {
                     try {
                         val channel = kotlinx.coroutines.channels.Channel<Pair<com.google.gson.JsonElement, Int>>(4)
                         var typeTotal = 0
@@ -231,7 +239,16 @@ class SyncRepository @Inject constructor(
                     ))
                 }
             }.awaitAll()
+            }
         }
+
+        // Phase 1: sync lightweight types first — they finish in seconds
+        android.util.Log.d(TAG, "Phase 1: syncing ${lightTypes.size} lightweight types")
+        syncTypes(lightTypes)
+
+        // Phase 2: sync heavy types with per-second samples
+        android.util.Log.d(TAG, "Phase 2: syncing ${heavyTypesList.size} heavy types (samples)")
+        syncTypes(heavyTypesList)
 
         try {
             val token = healthConnectRepository.getChangesToken()
@@ -296,17 +313,6 @@ class SyncRepository @Inject constructor(
         }
 
         return totalRecords
-    }
-
-    suspend fun deleteRecords(recordType: String, uuids: List<String>) {
-        try {
-            apiService.deleteRecords(recordType, DeleteRequest(uuids))
-        } catch (_: Exception) { }
-
-        val typeInfo = RECORD_TYPES.find { it.name == recordType } ?: return
-        try {
-            healthConnectRepository.deleteRecordsByIds(typeInfo.recordClass, uuids)
-        } catch (_: Exception) { }
     }
 
     fun resetState() {

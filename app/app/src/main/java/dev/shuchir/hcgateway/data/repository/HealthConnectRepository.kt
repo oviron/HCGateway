@@ -25,21 +25,15 @@ class HealthConnectRepository @Inject constructor(
     val isAvailable: Boolean get() = healthConnectClient != null
 
     val permissions: Set<String> by lazy {
-        RECORD_TYPES.flatMap { type ->
-            listOf(
-                HealthPermission.getReadPermission(type.recordClass),
-                HealthPermission.getWritePermission(type.recordClass),
-            )
+        RECORD_TYPES.map { type ->
+            HealthPermission.getReadPermission(type.recordClass)
         }.toSet() + setOf(HealthPermission.PERMISSION_READ_HEALTH_DATA_HISTORY)
     }
 
     // Required permissions for hasAllPermissions check (excludes optional permissions)
     private val requiredPermissions: Set<String> by lazy {
-        RECORD_TYPES.flatMap { type ->
-            listOf(
-                HealthPermission.getReadPermission(type.recordClass),
-                HealthPermission.getWritePermission(type.recordClass),
-            )
+        RECORD_TYPES.map { type ->
+            HealthPermission.getReadPermission(type.recordClass)
         }.toSet()
     }
 
@@ -52,13 +46,12 @@ class HealthConnectRepository @Inject constructor(
         // the granted set even with "Allow all". Count those as satisfied.
         val supported = granted + (requiredPermissions - granted).filter { perm ->
             // A permission is unsupported if HC doesn't list it at all.
-            // Heuristic: if HC granted at least one permission, any permission NOT in granted
-            // that also has no sibling (READ↔WRITE pair) in granted is likely unsupported.
+            // Heuristic: if the READ permission for this type is not in granted,
+            // it's likely unsupported on this device (e.g. MindfulnessSession).
             val base = perm.substringAfterLast(".")
-                .removePrefix("READ_").removePrefix("WRITE_")
-            val hasReadSibling = "android.permission.health.READ_$base" in granted
-            val hasWriteSibling = "android.permission.health.WRITE_$base" in granted
-            !hasReadSibling && !hasWriteSibling
+                .removePrefix("READ_")
+            val hasReadPerm = "android.permission.health.READ_$base" in granted
+            !hasReadPerm
         }
         return requiredPermissions.all { it in supported }
     }
@@ -170,18 +163,6 @@ class HealthConnectRepository @Inject constructor(
         }
 
         return ChangeResult(upserted, currentToken, false, tokenExpired = false)
-    }
-
-    suspend fun insertRecords(records: List<Record>) {
-        healthConnectClient?.insertRecords(records)
-    }
-
-    suspend fun deleteRecordsByIds(recordClass: KClass<out Record>, ids: List<String>) {
-        healthConnectClient?.deleteRecords(
-            recordType = recordClass,
-            recordIdsList = ids,
-            clientRecordIdsList = ids,
-        )
     }
 
     private fun recordClassName(kClass: KClass<out Record>): String {
